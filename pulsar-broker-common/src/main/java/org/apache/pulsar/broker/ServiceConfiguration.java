@@ -4102,6 +4102,15 @@ public class ServiceConfiguration implements PulsarConfiguration {
 
     @FieldContext(
             category = CATEGORY_METRICS,
+            doc = "Subscriptions with more individually acknowledged ranges than this are skipped when reading "
+                    + "the backlog age quantiles, because finding an entry walks those ranges while holding the "
+                    + "cursor read lock. A skipped subscription has no quantile series until its range count "
+                    + "drops below the limit. A value of 0 or less means no limit. Default is 50000."
+    )
+    private int subscriptionBacklogAgeQuantilesMaxIndividualAckRanges = 50_000;
+
+    @FieldContext(
+            category = CATEGORY_METRICS,
             doc = "Enable splitting topic and partition label in Prometheus.\n"
                     + " If enabled, a topic name will split into 2 parts, one is topic name without partition index,\n"
                     + " another one is partition index, e.g. (topic=xxx, partition=0).\n"

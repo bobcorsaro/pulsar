@@ -86,9 +86,11 @@ public class PersistentTopicBacklogAgeQuantilesTest {
         final List<Entry> unacked = new CopyOnWriteArrayList<>();
         final List<Integer> requestedN = new CopyOnWriteArrayList<>();
         final List<IndividualDeletedEntries> requestedModes = new CopyOnWriteArrayList<>();
+        volatile int individualAckRanges;
 
         FakeCursor() {
             doReturn(true).when(cursor).isDurable();
+            doAnswer(invocation -> individualAckRanges).when(cursor).getTotalNonContiguousDeletedMessagesRange();
             doAnswer(invocation -> (long) unacked.size()).when(cursor).getNumberOfEntriesInBacklog(anyBoolean());
             doAnswer(invocation -> {
                 int n = invocation.getArgument(0);
@@ -329,5 +331,49 @@ public class PersistentTopicBacklogAgeQuantilesTest {
 
         assertThat(ages()).isEmpty();
         assertThat(new ArrayList<>(fake.requestedN)).hasSize(1);
+    }
+
+    @Test
+    public void subscriptionWithTooManyIndividualAckRangesIsSkipped() throws Exception {
+        configureQuantiles(0.5, 0.99);
+        pulsarTestContext.getConfig().setSubscriptionBacklogAgeQuantilesMaxIndividualAckRanges(1000);
+        FakeCursor fragmented = addSubscriptionWithBacklog(SUBSCRIPTION, 10);
+        fragmented.individualAckRanges = 1001;
+        FakeCursor healthy = addSubscriptionWithBacklog("healthy", 10);
+        healthy.individualAckRanges = 1000;
+
+        refresh();
+
+        assertThat(fragmented.requestedN).isEmpty();
+        assertThat(ages()).isEmpty();
+        assertThat(healthy.requestedN).isNotEmpty();
+        assertThat(topic.getBestEffortBacklogAgeQuantileSeconds("healthy")).containsOnlyKeys(0.5, 0.99);
+    }
+
+    @Test
+    public void subscriptionIsReadAgainOnceItsRangeCountDropsBelowTheLimit() throws Exception {
+        configureQuantiles(0.5);
+        pulsarTestContext.getConfig().setSubscriptionBacklogAgeQuantilesMaxIndividualAckRanges(1000);
+        FakeCursor fake = addSubscriptionWithBacklog(SUBSCRIPTION, 10);
+        fake.individualAckRanges = 5000;
+        refresh();
+        assertThat(ages()).isEmpty();
+
+        fake.individualAckRanges = 10;
+        refresh();
+
+        assertThat(ages()).containsOnlyKeys(0.5);
+    }
+
+    @Test
+    public void nonPositiveLimitMeansNoLimit() throws Exception {
+        configureQuantiles(0.5);
+        pulsarTestContext.getConfig().setSubscriptionBacklogAgeQuantilesMaxIndividualAckRanges(0);
+        FakeCursor fake = addSubscriptionWithBacklog(SUBSCRIPTION, 10);
+        fake.individualAckRanges = 10_000_000;
+
+        refresh();
+
+        assertThat(ages()).containsOnlyKeys(0.5);
     }
 }

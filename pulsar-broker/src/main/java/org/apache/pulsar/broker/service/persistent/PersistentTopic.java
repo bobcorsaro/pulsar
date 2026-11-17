@@ -37,6 +37,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -335,6 +336,9 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
     private volatile Map<String, OldestPositionInfo> subscriptionOldestPositionInfos;
     // Per subscription, the publish timestamp of the entry at each configured backlog age quantile.
     private volatile Map<String, Map<Double, Long>> subscriptionBacklogAgeQuantileTimestamps;
+    // Subscriptions currently skipped because they have too many individually acknowledged ranges, so that the
+    // warning is logged when a subscription becomes skipped rather than on every refresh.
+    private final Set<String> subscriptionsSkippedForBacklogAgeQuantiles = ConcurrentHashMap.newKeySet();
 
     @Value
     private static class OldestPositionInfo {
@@ -4299,11 +4303,15 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         List<Double> quantiles = brokerService.pulsar().getConfiguration().getSubscriptionBacklogAgeQuantiles();
         if (!preciseTimeBasedBacklogQuotaCheck || quantiles == null || quantiles.isEmpty()) {
             subscriptionBacklogAgeQuantileTimestamps = null;
+            subscriptionsSkippedForBacklogAgeQuantiles.clear();
             return CompletableFuture.completedFuture(null);
         }
 
+        int maxIndividualAckRanges = brokerService.pulsar().getConfiguration()
+                .getSubscriptionBacklogAgeQuantilesMaxIndividualAckRanges();
         Map<String, Map<Double, Long>> refreshed = new ConcurrentHashMap<>();
         List<CompletableFuture<Void>> futures = new ArrayList<>();
+        Set<String> skipped = new HashSet<>();
         for (Map.Entry<String, PersistentSubscription> subscriptionEntry : subscriptions.entrySet()) {
             ManagedCursor cursor = subscriptionEntry.getValue().getCursor();
             if (!cursor.isDurable()) {
@@ -4311,6 +4319,21 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
             }
             long backlog = cursor.getNumberOfEntriesInBacklog(true);
             if (backlog <= 0) {
+                continue;
+            }
+            // Finding an entry walks the individually acknowledged ranges under the cursor read lock, so skip the
+            // subscriptions where that walk could be long.
+            int individualAckRanges = maxIndividualAckRanges > 0
+                    ? cursor.getTotalNonContiguousDeletedMessagesRange() : 0;
+            if (maxIndividualAckRanges > 0 && individualAckRanges > maxIndividualAckRanges) {
+                skipped.add(subscriptionEntry.getKey());
+                if (subscriptionsSkippedForBacklogAgeQuantiles.add(subscriptionEntry.getKey())) {
+                    log.warn().attr("subscription", subscriptionEntry.getKey())
+                            .attr("individualAckRanges", individualAckRanges)
+                            .attr("limit", maxIndividualAckRanges)
+                            .log("Skipping backlog age quantiles for a subscription with too many individually "
+                                    + "acknowledged ranges");
+                }
                 continue;
             }
             Map<Double, Long> timestamps =
@@ -4322,6 +4345,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                 futures.add(readBacklogAgeQuantileTimestamp(cursor, backlog, quantile, timestamps));
             }
         }
+        subscriptionsSkippedForBacklogAgeQuantiles.retainAll(skipped);
         return FutureUtil.waitForAll(futures).thenRun(() -> subscriptionBacklogAgeQuantileTimestamps = refreshed);
     }
 
